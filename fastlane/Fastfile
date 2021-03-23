@@ -1,0 +1,284 @@
+# Customise this file, documentation can be found here:
+# https://github.com/KrauseFx/fastlane/tree/master/docs
+fastlane_require 'fileutils'
+fastlane_require 'shellwords'
+
+fastlane_version "2.141.0"
+default_platform :ios
+
+STAGING_API_URL = 'https://staging.exp.host/'
+
+# path relative to Fastfile
+output_directory = File.expand_path('./Deployment')
+
+def set_bundle_version_from_commit_count
+  bundle_version = Actions.lane_context[SharedValues::VERSION_NUMBER] + ".10" + number_of_commits.to_s
+  puts "Setting build number (CFBundleVersion) to '" + bundle_version + "'..."
+  set_info_plist_value(
+    path: "./ios/Exponent/Supporting/Info.plist",
+    key: "CFBundleVersion",
+    value: bundle_version
+  )
+end
+
+# This will keep a copy of the original Info.plist
+@original_info_plist = nil
+
+def save_original_info_plist
+  update_info_plist(
+    xcodeproj: "ios/Exponent.xcodeproj",
+    plist_path: "Exponent/Supporting/Info.plist",
+    block: proc do |plist|
+      @original_info_plist = Marshal.load(Marshal.dump(plist))
+    end
+  )
+end
+
+def restore_original_info_plist
+  update_info_plist(
+    xcodeproj: "ios/Exponent.xcodeproj",
+    plist_path: "Exponent/Supporting/Info.plist",
+    block: proc do |plist|
+      puts "Restoring original Info.plist..."
+      plist.replace(@original_info_plist)
+    end
+  )
+end
+
+def remove_background_location
+  update_info_plist(
+    xcodeproj: "ios/Exponent.xcodeproj",
+    plist_path: "Exponent/Supporting/Info.plist",
+    block: proc do |plist|
+      puts "Removing background location permission strings and background mode..."
+
+      puts "Deleting NSLocationAlwaysAndWhenInUseUsageDescription key..."
+      plist.delete("NSLocationAlwaysAndWhenInUseUsageDescription")
+
+      puts "Deleting NSLocationAlwaysUsageDescription key..."
+      plist.delete("NSLocationAlwaysUsageDescription")
+
+      puts "Deleting location from UIBackgroundModes..."
+      plist["UIBackgroundModes"].delete("location")
+    end
+  )
+end
+
+def remove_background_audio
+  update_info_plist(
+    xcodeproj: "ios/Exponent.xcodeproj",
+    plist_path: "Exponent/Supporting/Info.plist",
+    block: proc do |plist|
+      puts "Removing background audio background mode..."
+      plist["UIBackgroundModes"].delete("audio")
+    end
+  )
+end
+
+def configure_for_app_store
+  puts "Configuring app for App Store submission..."
+  remove_background_location
+  remove_background_audio
+end
+
+platform :ios do
+
+  before_all do
+    FileUtils.mkdir_p(output_directory)
+    Actions.lane_context[SharedValues::VERSION_NUMBER] = get_version_number(
+      xcodeproj: "./ios/Exponent.xcodeproj",
+      target: "Exponent"
+    )
+    save_original_info_plist
+    set_bundle_version_from_commit_count
+    setup_circle_ci
+  end
+
+  lane :test do
+    scan(
+      workspace: "ios/Exponent.xcworkspace",
+      scheme: "Exponent",
+      devices: ["iPhone SE", "iPhone X"],
+      clean: false,
+    )
+  end
+
+  lane :create_simulator_build do
+    directory = "./ios/simulator-build"
+    puts "Build will be written to: " + File.expand_path(directory)
+    xcbuild(
+      workspace: "ios/Exponent.xcworkspace",
+      scheme: "Exponent",
+      sdk: "iphonesimulator",
+      configuration: "Release",
+      derivedDataPath: directory,
+      xcargs: "ARCHS=\"x86_64\" ONLY_ACTIVE_ARCH=NO -quiet",
+      raw_buildlog: is_ci?
+    )
+  end
+
+  lane :create_expo_client_build do
+    directory = "./ios" + prompt(
+      ci_input: "/../expo-client-build",
+      text: "Please enter the path where we should output the build, relative to ./ios (i.e. ../my-build):",
+    )
+    puts "Build will be written to: " + File.expand_path(directory)
+    xcbuild(
+      workspace: "ios/Exponent.xcworkspace",
+      scheme: "Exponent",
+      configuration: "Release",
+      derivedDataPath: directory,
+      sdk: "iphoneos",
+      destination: "generic/platform=iOS",
+      archive: true,
+      archive_path: directory + "/Exponent.xcarchive",
+      xcargs: "CODE_SIGNING_ALLOWED=NO APP_OWNER=Public -quiet"
+    )
+  end
+
+  lane :release do
+    cert(
+      team_id: "C8D8QTF339",
+    )
+
+    sigh(
+      app_identifier: "host.exp.Exponent",
+      output_path: output_directory,
+      filename: "Exponent-distribution.mobileprovision",
+    )
+
+    xcodebuild_args = {
+      APP_PROVISIONING_PROFILE: Actions.lane_context[Actions::SharedValues::SIGH_UDID],
+    }
+    xcodebuild_args = xcodebuild_args.map do |k,v|
+      "#{k.to_s.shellescape}=#{v.shellescape}"
+    end.join ' '
+
+    configure_for_app_store
+
+    gym(
+      workspace: "ios/Exponent.xcworkspace",
+      scheme: "Exponent",
+      configuration: "Release",
+      xcargs: xcodebuild_args,
+      clean: true,
+      output_directory: output_directory,
+      output_name: "Exponent.ipa",
+    )
+
+    deliver(
+      team_id: "17102800",
+    )
+  end
+
+  after_all do |lane|
+    # FileUtils.rm_rf(output_directory)
+    restore_original_info_plist
+  end
+
+  error do |lane, exception|
+    # slack(
+    #   message: exception.message,
+    #   success: false
+    # )
+  end
+
+end
+
+platform :android do
+
+  private_lane :verify_changelog_exists do |version_code: |
+    changelog_path = "android/metadata/en-US/changelogs/#{version_code}.txt"
+    UI.user_error!("Missing changelog file at #{changelog_path}") unless File.exist?(changelog_path)
+    UI.message("Changelog exists for version code #{version_code}")
+  end
+
+  private_lane :verify_upload_to_staging do |version_name: |
+    require 'open-uri'
+    staging_version = nil
+    begin
+      versions = JSON.parse(open(URI.join(STAGING_API_URL, "/--/api/v2/versions")).read)
+      latest_major_version = versions['sdkVersions'].keys.map(&:to_i).sort().reverse().first()
+      latest_version = versions['sdkVersions']["#{latest_major_version}.0.0"]
+      staging_version = latest_version['androidClientVersion']
+    rescue StandardError => e
+      UI.user_error!("Unable to validate androidClientVersion for latest SDK version on versions endpoint: #{e.inspect}. If this issue persists, remove the verify_upload_to_staging step from Fastfile and manually verify that the Android client has been deployed and tested on staging.")
+    end
+
+    unless staging_version == version_name
+      UI.user_error!("APK version #{version_name} is not yet uploaded to staging. Please download from the client_android CI job, test and upload manually.")
+    end
+    UI.message "APK version #{version_name} has been uploaded to staging"
+  end
+
+  lane :start do
+    gradle(
+      project_dir: "android",
+      task: "install",
+      build_type: "Debug",
+    )
+    adb(command: "shell am start -n host.exp.exponent/host.exp.exponent.LauncherActivity")
+  end
+
+  def devicefarm_run(arn)
+    JSON.load(`aws devicefarm --region us-west-2 get-run --arn #{arn}`)
+  end
+
+  def devicefarm_follow_run(arn)
+    until (run = devicefarm_run(arn)["run"]) && run["result"]  != "PENDING"
+      UI.message("Run pending...")
+      sleep 60
+    end
+    UI.shell_error!("Run #{run["result"]}") unless run["result"] == "PASSED"
+    UI.success("Run successful")
+  end
+
+  lane :devicefarm do
+    commit_info = last_git_commit
+    channel = commit_info[:commit_hash]
+    ENV["TEST_SUITE_URI"] = "exp://exp.host/@exponent_ci_bot/test-suite/--/all?release-channel=#{channel}"
+    ENV["TEST_CONFIG"] = {
+      includeModules:  '.*',
+      includeSdkVersions: ['UNVERSIONED'],
+      includeTestTypes: ['test-suite'],
+      isInCI: true,
+    }.to_json
+    ENV["DEVICEFARM_PROJECT_NAME"] = "exponent"
+    ENV["DEVICEFARM_DEVICE_POOL"] = "android-test-device-pool"
+    ENV["AWS_ACCESS_KEY_ID"] ||= `aws configure get aws_access_key_id`.chomp
+    ENV["AWS_SECRET_ACCESS_KEY"] ||= `aws configure get aws_secret_access_key`.chomp
+    upload_result = gradle(
+      project_dir: "android",
+      task: "app:devicefarmUpload",
+    )
+    result_info = upload_result.match(/View the INSTRUMENTATION run.*\/projects\/(?<project_id>.*)\/runs\/(?<run_id>.*)$/)
+    UI.shell_error!("Apks not uploaded!") unless result_info
+    devicefarm_follow_run("arn:aws:devicefarm:us-west-2:274251141632:run:#{result_info[:project_id]}/#{result_info[:run_id]}")
+  end
+
+  lane :build do |build_type: "Debug", sign: true|
+    ENV['ANDROID_UNSIGNED'] = '1' unless sign
+    gradle(
+      project_dir: "android",
+      task: "app:assemble",
+      build_type: build_type,
+    )
+  end
+
+  lane :prod_release do
+    build_gradle = File.read("../android/app/build.gradle")
+
+    verify_changelog_exists(version_code: build_gradle.match(/versionCode (\d+)/)[1])
+    verify_upload_to_staging(version_name: build_gradle.match(/versionName '([\d\.]+)'/)[1])
+
+    supply(
+      package_name: "host.exp.exponent",
+      metadata_path: "./fastlane/android/metadata",
+      apk: "./android/app/build/outputs/apk/release/app-release.apk",
+      track: "production",
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+
+end

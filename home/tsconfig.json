@@ -1,0 +1,11 @@
+{
+  "extends": "expo-module-scripts/tsconfig.base",
+  "compilerOptions": {
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "noEmit": true,
+    "paths": {
+      "@expo/vector-icons": ["react-native-vector-icons"]
+    }
+  }
+}
